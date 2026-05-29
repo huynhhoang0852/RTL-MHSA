@@ -1,0 +1,130 @@
+`timescale 1ns / 1ps
+
+module tb_multihead_attention_top();
+
+    // ==========================================
+    // 1. KHAI BÁO TÍN HIỆU
+    // ==========================================
+    logic        clk;
+    logic        rst_n;
+    logic        start;
+    logic        done;
+
+    // Bus RAM X
+    logic [11:0] addr_X;
+    logic [15:0] data_X;
+
+    // Bus RAM Z Final
+    logic        we_Z_final;
+    logic [11:0] addr_Z_final_A;
+    logic [11:0] addr_Z_final_B;
+    logic [15:0] data_Z_final_A;
+    logic [15:0] data_Z_final_B;
+
+    // ==========================================
+    // 2. KHỞI TẠO MODULE TOP (DUT)
+    // ==========================================
+    multihead_attention_top uut (
+        .clk            (clk),
+        .rst_n          (rst_n),
+        .start          (start),
+        .done           (done),
+        .addr_X         (addr_X),
+        .data_X         (data_X),
+        .we_Z_final     (we_Z_final),
+        .addr_Z_final_A (addr_Z_final_A),
+        .addr_Z_final_B (addr_Z_final_B),
+        .data_Z_final_A (data_Z_final_A),
+        .data_Z_final_B (data_Z_final_B)
+    );
+
+    // ==========================================
+    // 3. TẠO CLOCK (Tần số 100MHz -> Chu kỳ 10ns)
+    // ==========================================
+    initial begin
+        clk = 1'b0;
+        forever #5 clk = ~clk;
+    end
+
+    // ==========================================
+    // 4. MÔ PHỎNG RAM X & RAM Z (Behavioral RAM)
+    // ==========================================
+    // Mảng nhớ mô phỏng 4096 words x 16 bit
+    logic [15:0] ram_x_mem [0:4095];
+    logic [15:0] ram_z_mem [0:4095];
+
+    // RAM X (Read-Only) có độ trễ 1 chu kỳ (Khớp với M10K block)
+    always_ff @(posedge clk) begin
+        data_X <= ram_x_mem[addr_X];
+    end
+
+    // RAM Z (Write-Only Dual Port) để hứng kết quả
+    always_ff @(posedge clk) begin
+        if (we_Z_final) begin
+            ram_z_mem[addr_Z_final_A] <= data_Z_final_A;
+            ram_z_mem[addr_Z_final_B] <= data_Z_final_B;
+            
+            // In log ra console để theo dõi quá trình ghi kết quả
+            $display("[Thời gian %0t] Đã ghi Z[%0d] = %h, Z[%0d] = %h", 
+                     $time, addr_Z_final_A, data_Z_final_A, addr_Z_final_B, data_Z_final_B);
+        end
+    end
+
+    // ==========================================
+    // 5. KỊCH BẢN TEST (TEST STIMULUS)
+    // ==========================================
+    initial begin
+        // Khởi tạo file log để lưu kết quả Z cuối cùng
+        int fd;
+        
+        $display("==================================================");
+        $display(" BẮT ĐẦU MÔ PHỎNG MULTI-HEAD ATTENTION");
+        $display("==================================================");
+
+        // Nạp ma trận X vào RAM giả lập từ file hex
+        // LƯU Ý: Cần chuyển file matrix_X.mif thành matrix_X.hex trước!
+        $readmemh("matrix_X.hex", ram_x_mem);
+        
+        // Khởi tạo các tín hiệu reset
+        rst_n = 1'b0;
+        start = 1'b0;
+        
+        // Chờ 20ns rồi nhả reset
+        #20;
+        rst_n = 1'b1;
+        $display("[%0t] Hệ thống đã sẵn sàng. Kích hoạt tín hiệu START...", $time);
+        
+        // Bắn xung start 1 chu kỳ clock
+        #10;
+        start = 1'b1;
+        #10;
+        start = 1'b0;
+
+        // Tiến trình theo dõi FSM của Top Module
+        fork
+            begin
+                wait(uut.state == 3'd1); $display("[%0t] Đang chạy Phase 1: Linear QKV...", $time);
+                wait(uut.state == 3'd2); $display("[%0t] Đang chạy Phase 2: Bốn Attention Heads...", $time);
+                wait(uut.state == 3'd3); $display("[%0t] Đang chạy Phase 3: Linear Output...", $time);
+            end
+        join_none
+
+        // Đợi cờ done báo hoàn thành (Có thể mất hàng trăm ngàn chu kỳ clock)
+        wait(done == 1'b1);
+        $display("==================================================");
+        $display("[%0t] THUẬT TOÁN HOÀN TẤT!", $time);
+        
+        // Trích xuất kết quả RAM Z ra file text để kiểm tra với Python
+        fd = $fopen("matrix_Z_out.txt", "w");
+        for (int i = 0; i < 4096; i++) begin
+            $fdisplay(fd, "%04X", ram_z_mem[i]);
+        end
+        $fclose(fd);
+        $display("-> Đã lưu kết quả ma trận Z vào file 'matrix_Z_out.txt'");
+        $display("==================================================");
+
+        #100;
+        $stop; // Dừng mô phỏng (ModelSim/Questa)
+    end
+
+endmodule

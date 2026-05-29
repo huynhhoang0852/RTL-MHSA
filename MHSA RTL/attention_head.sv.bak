@@ -1,0 +1,280 @@
+`timescale 1ns / 1ps
+
+module attention_head (
+    input  logic        clk,
+    input  logic        rst_n,
+    input  logic        start,
+    output logic        done,
+    
+    // =========================================================
+    // CỔNG GIAO TIẾP VỚI KHỐI LINEAR QKV (NẠP DỮ LIỆU)
+    // Các tín hiệu này nối thẳng với we_Q[h], we_K[h]... của khối Linear
+    // =========================================================
+    input  logic        linear_we,
+    input  logic [9:0]  linear_addr, // 10-bit cho 1024 words (64x16)
+    input  logic [15:0] linear_data_Q,
+    input  logic [15:0] linear_data_K,
+    input  logic [15:0] linear_data_V,
+	 
+	 // Thêm vào khối khai báo port (bên trong ngoặc đơn module attention_head)
+    input  logic [9:0]  addr_Z_read,
+    output logic [15:0] data_Z_out
+);
+
+    // ==========================================
+    // 1. KHAI BÁO TÍN HIỆU ĐỊNH TUYẾN FSM
+    // ==========================================
+    logic [1:0]  step; // 0: Tính Score, 1: Tính Softmax, 2: Tính Z
+    logic [6:0]  i, j, k;
+    
+    // Giới hạn vòng lặp k (Dot-product length) linh hoạt theo từng pha
+    logic [6:0] dot_limit;
+    assign dot_limit = (step == 0) ? 7'd16 : 7'd64;
+
+    logic [15:0] mac1_result, mac2_result;
+    logic mac_en, mac_clr;
+    logic we_Score, we_Z;
+
+    logic signed [15:0] max_array [64]; 
+
+    // ==========================================
+    // 2. KHỞI TẠO BỘ NHỚ RAM TRONG HEAD (1024 words / 64x16)
+    // Dùng IP RAM Dual-Port, Port A để khối Linear ghi, Port B để MAC đọc
+    // ==========================================
+    logic [9:0] addr_Q_A, addr_K_A, addr_K_B, addr_V_A, addr_V_B;
+    logic [15:0] data_Q_A, data_K_A, data_K_B, data_V_A, data_V_B;
+
+    // Bộ MUX định tuyến: Khi Linear đang nạp dữ liệu (linear_we=1), nhường Port A cho Linear
+    assign addr_Q_A = linear_we ? linear_addr : {i[5:0], k[3:0]}; // Q[i, k]
+    assign addr_K_A = linear_we ? linear_addr : {j[5:0], k[3:0]}; // K[j, k]
+    assign addr_K_B =                           {j[5:0] + 6'd1, k[3:0]}; // K[j+1, k]
+    assign addr_V_A = linear_we ? linear_addr : {k[5:0], j[3:0]}; // V[k, j]
+    assign addr_V_B =                           {k[5:0], j[3:0] + 4'd1}; // V[k, j+1]
+
+    // IP Dual-Port RAM 1024x16 (Q, K, V)
+    RAM_1024x16 u_ram_Q (.clock(clk), .address_a(addr_Q_A), .address_b(10'd0),   .data_a(linear_data_Q), .data_b(16'd0), .wren_a(linear_we), .wren_b(1'b0), .q_a(data_Q_A), .q_b());
+    RAM_1024x16 u_ram_K (.clock(clk), .address_a(addr_K_A), .address_b(addr_K_B), .data_a(linear_data_K), .data_b(16'd0), .wren_a(linear_we), .wren_b(1'b0), .q_a(data_K_A), .q_b(data_K_B));
+    RAM_1024x16 u_ram_V (.clock(clk), .address_a(addr_V_A), .address_b(addr_V_B), .data_a(linear_data_V), .data_b(16'd0), .wren_a(linear_we), .wren_b(1'b0), .q_a(data_V_A), .q_b(data_V_B));
+
+    // RAM Z (Kết quả cuối cùng) - Cũng 1024 words
+    logic [9:0] addr_Z_A, addr_Z_B;
+	 assign addr_Z_A = (state == S_IDLE) ? addr_Z_read : {i[5:0], j[3:0]};
+    assign addr_Z_B = {i[5:0], j[3:0] + 4'd1};
+    RAM_1024x16 u_ram_Z (
+        .clock(clk), 
+        .address_a(addr_Z_A), .address_b(addr_Z_B), 
+        .data_a(mac1_result), .data_b(mac2_result), 
+        .wren_a(we_Z), .wren_b(we_Z), 
+        .q_a(data_Z_out), // <--- KẾT NỐI VÀO ĐÂY
+        .q_b()
+    );
+	 
+    // ==========================================
+    // 3. KHỞI TẠO RAM SCORE & SOFTMAX (4096 words / 64x64)
+    // ==========================================
+    logic [11:0] softmax_addr_Score;
+    logic [11:0] addr_Score_A, addr_Score_B;
+    assign addr_Score_A = (step == 1) ? softmax_addr_Score : {i[5:0], j[5:0]};
+    assign addr_Score_B = (step == 1) ? 12'd0              : {i[5:0], j[5:0] + 6'd1}; 
+
+    // TOÁN HỌC MỚI: Scale Score chia cho sqrt(16) = 4 -> Dịch phải 2 bit
+    logic signed [15:0] score_even_scaled, score_odd_scaled;
+    logic [15:0] data_Score_A;
+    
+    assign score_even_scaled = $signed({ {2{mac1_result[15]}}, mac1_result[15:2] }) + 16'(mac1_result[1]);
+    assign score_odd_scaled  = $signed({ {2{mac2_result[15]}}, mac2_result[15:2] }) + 16'(mac2_result[1]);
+    
+    logic we_Score_B;
+    assign we_Score_B = (step == 1) ? 1'b0 : we_Score;
+    RAM_4096x16 u_ram_Score (.clock(clk), .address_a(addr_Score_A), .address_b(addr_Score_B), .data_a(score_even_scaled), .data_b(score_odd_scaled), .wren_a(we_Score), .wren_b(we_Score_B), .q_a(data_Score_A), .q_b());
+
+    // RAM SOFTMAX
+    logic        softmax_we;
+    logic [11:0] softmax_addr_Softmax;
+    logic [15:0] softmax_data_out, data_Softmax_out;
+    logic [11:0] addr_Softmax;
+    logic        we_Softmax_ram;
+    assign addr_Softmax   = (step == 1) ? softmax_addr_Softmax : {i[5:0], k[5:0]};
+    assign we_Softmax_ram = (step == 1) ? softmax_we           : 1'b0;
+    RAM_4096x16_1P u_ram_Softmax (.clock(clk), .address(addr_Softmax), .data(softmax_data_out), .wren(we_Softmax_ram), .q(data_Softmax_out));
+
+    // ==========================================
+    // 4. MUX DỮ LIỆU CHO 2 LÕI MAC (DUAL-CORE DUAL-USE)
+    // ==========================================
+    logic [15:0] mac_a, mac_1_b, mac_2_b;
+
+    // Pha 0 (Score): A = Q, B = K
+    // Pha 2 (Z)    : A = Softmax, B = V
+    assign mac_a   = (step == 0) ? data_Q_A : (step == 2) ? data_Softmax_out : 16'd0;
+    assign mac_1_b = (step == 0) ? data_K_A : (step == 2) ? data_V_A         : 16'd0;
+    assign mac_2_b = (step == 0) ? data_K_B : (step == 2) ? data_V_B         : 16'd0;
+
+    mac u_mac_1 (.clk(clk), .rst_n(rst_n), .en(mac_en), .clr_acc(mac_clr), .a_in(mac_a), .b_in(mac_1_b), .mac_out(mac1_result));
+    mac u_mac_2 (.clk(clk), .rst_n(rst_n), .en(mac_en), .clr_acc(mac_clr), .a_in(mac_a), .b_in(mac_2_b), .mac_out(mac2_result));
+
+    // ==========================================
+    // 5. TÍCH HỢP SOFTMAX TOP (KHÔNG ĐỔI)
+    // ==========================================
+    logic [12:0] softmax_addr_Exp;
+    logic [15:0] data_Exp_out;
+    logic        start_softmax, softmax_done;
+
+    logic [11:0] safe_addr_Exp;
+    assign safe_addr_Exp = (softmax_addr_Exp >= 13'd4095) ? 12'd4095 : softmax_addr_Exp[11:0];
+    ROM_EXP u_rom_exp (.clock(clk), .address(safe_addr_Exp), .q(data_Exp_out));
+
+    logic [5:0] softmax_current_row;
+    logic signed [15:0] current_max_val;
+    assign softmax_current_row = softmax_addr_Score[11:6];
+    assign current_max_val     = max_array[softmax_current_row];
+
+    softmax_top u_softmax (
+        .clk          (clk), 
+        .rst_n        (rst_n), 
+        .start        (start_softmax), 
+        .done         (softmax_done),
+        .addr_Score   (softmax_addr_Score), 
+        .data_Score   (data_Score_A),
+        .max_val_in   (current_max_val),
+        .addr_Exp     (softmax_addr_Exp),      
+        .data_Exp     (data_Exp_out),
+        .we_Softmax   (softmax_we), 
+        .addr_Softmax (softmax_addr_Softmax), 
+        .data_Softmax (softmax_data_out)
+    );
+
+    // ==========================================
+    // 6. MASTER FSM (PIPELINE ĐỘNG THEO DOT_LIMIT)
+    // ==========================================
+    typedef enum logic [2:0] {
+        S_IDLE          = 3'd0,
+        S_MAC_PIPELINE  = 3'd1, 
+        S_WRITE_RAM     = 3'd2,
+        S_NEXT_ELEM     = 3'd3,
+        S_START_SOFTMAX = 3'd4,
+        S_WAIT_SOFTMAX  = 3'd5,
+        S_DONE          = 3'd6
+    } state_t;
+    state_t state;
+
+    // logic giới hạn biến cột j (Score: 64, Z: 16)
+    logic [6:0] j_limit;
+    assign j_limit = (step == 0) ? 7'd62 : 7'd14; 
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state         <= S_IDLE; 
+            done          <= 1'b0; 
+            step          <= '0;
+            we_Score      <= 1'b0; 
+            we_Z          <= 1'b0;
+            mac_en        <= 1'b0; 
+            mac_clr       <= 1'b0; 
+            start_softmax <= 1'b0;
+            i <= '0; j <= '0; k <= '0;
+        end 
+        else begin
+            case (state)
+                S_IDLE: begin
+                    done <= 1'b0;
+                    if (start) begin
+                        mac_clr <= 1'b1; 
+                        state   <= S_MAC_PIPELINE;
+                        step    <= '0; i <= '0; j <= '0; k <= '0;
+                    end
+                end
+
+                S_MAC_PIPELINE: begin
+                    // Pipeline động: Kết thúc ở dot_limit (16 hoặc 64)
+                    if (k == 0) begin
+                        mac_clr <= 1'b0; 
+                        mac_en  <= 1'b1; 
+                    end 
+                    else if (k >= 1 && k <= dot_limit - 1) begin
+                        mac_clr <= 1'b0;
+                        mac_en  <= 1'b1; 
+                    end
+                    else if (k == dot_limit) begin
+                        mac_en <= 1'b0;  
+                    end
+
+                    if (k < dot_limit + 1'b1) begin
+                        k <= k + 1'b1;
+                    end else begin
+                        k     <= '0;
+                        state <= S_WRITE_RAM; 
+                    end
+                end
+
+                S_WRITE_RAM: begin
+                    if (step == 0) begin
+                        we_Score <= 1'b1; 
+                        
+                        // Tìm Max Online 
+                        if (j == 0) begin
+                            max_array[i] <= (score_even_scaled > score_odd_scaled) ? score_even_scaled : score_odd_scaled;
+                        end else begin
+                            if (score_even_scaled > max_array[i] && score_even_scaled >= score_odd_scaled) 
+                                max_array[i] <= score_even_scaled;
+                            else if (score_odd_scaled > max_array[i])
+                                max_array[i] <= score_odd_scaled;
+                        end
+                    end 
+                    else if (step == 2) begin
+                        we_Z <= 1'b1;
+                    end
+                    state <= S_NEXT_ELEM;
+                end
+
+                S_NEXT_ELEM: begin
+                    we_Score <= 1'b0; 
+                    we_Z     <= 1'b0;
+                    
+                    if (j < j_limit) begin
+                        j       <= j + 2; 
+                        mac_clr <= 1'b1;  
+                        state   <= S_MAC_PIPELINE; 
+                    end else begin
+                        j <= '0;
+                        if (i < 63) begin
+                            i       <= i + 1'b1;
+                            mac_clr <= 1'b1; 
+                            state   <= S_MAC_PIPELINE;
+                        end else begin
+                            i <= '0;
+                            if (step == 0) begin
+                                step  <= 2'd1; 
+                                state <= S_START_SOFTMAX;
+                            end else if (step == 2) begin
+                                state <= S_DONE; 
+                            end
+                        end
+                    end
+                end
+
+                S_START_SOFTMAX: begin
+                    start_softmax <= 1'b1;
+                    state         <= S_WAIT_SOFTMAX;
+                end
+
+                S_WAIT_SOFTMAX: begin
+                    start_softmax <= 1'b0;
+                    if (softmax_done) begin
+                        step    <= 2'd2;
+                        i       <= '0; j <= '0; k <= '0;
+                        mac_clr <= 1'b1; 
+                        state   <= S_MAC_PIPELINE;
+                    end
+                end
+
+                S_DONE: begin
+                    done  <= 1'b1;
+                    state <= S_IDLE;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule

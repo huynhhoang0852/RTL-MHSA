@@ -1,0 +1,356 @@
+`timescale 1ns / 1ps
+
+module attention_top (
+    input  logic        clk,
+    input  logic        rst_n,
+    input  logic        start,
+    output logic        done,
+    
+    // Giao tiếp với RAM chứa ma trận X (Bên ngoài - 1 PORT LÀ ĐỦ)
+    output logic [11:0] addr_X,
+    input  logic [15:0] data_X,
+    
+    // ---> BUS UART điều khiển từ System Controller <---
+    input  logic        mode_ai_running,
+    input  logic [11:0] uart_addr,
+    input  logic [15:0] uart_data_in,
+    input  logic        uart_we_Wq,
+    input  logic        uart_we_Wk,
+    input  logic        uart_we_Wv,
+    output logic [15:0] uart_data_Z_out
+);
+
+    // ==========================================
+    // 1. KHAI BÁO TÍN HIỆU ĐỊNH TUYẾN
+    // ==========================================
+    logic [1:0]  step; 
+    logic [15:0] mac1_result, mac2_result, mac3_result, mac4_result;
+    
+    // Tín hiệu điều khiển RAM/ROM
+    logic mac_en, mac_clr;
+    logic we_Q, we_K, we_V, we_Score, we_Z;
+
+    // ==========================================
+    // 2. BỘ NHỚ ONLINE SOFTMAX (Lưu 64 giá trị Max)
+    // ==========================================
+    logic signed [15:0] max_array [64]; // SystemVerilog style array declaration
+
+    // ==========================================
+    // 3. BỘ ĐẾM ĐỊA CHỈ THÔNG MINH (BƯỚC NHẢY 2)
+    // ==========================================
+    logic [6:0] i, j, k;
+
+    logic [11:0] addr_broadcast_X;
+    assign addr_broadcast_X = {i[5:0], 6'd0} + {6'd0, k[5:0]}; // X[i, k]
+    assign addr_X = addr_broadcast_X;
+
+    // Quét 2 cột cùng lúc (j và j+1)
+    logic [11:0] addr_col_even;
+    logic [11:0] addr_col_odd;
+    assign addr_col_even = {k[5:0], 6'd0} + {6'd0, j[5:0]};
+    assign addr_col_odd  = {k[5:0], 6'd0} + {6'd0, j[5:0] + 6'd1};
+
+    // Quét 2 hàng chuyển vị cùng lúc (cho ma trận K^T ở Pha 2)
+    logic [11:0] addr_row_T_even;
+    logic [11:0] addr_row_T_odd;
+    assign addr_row_T_even = {j[5:0], 6'd0} + {6'd0, k[5:0]};
+    assign addr_row_T_odd  = {j[5:0] + 6'd1, 6'd0} + {6'd0, k[5:0]};
+
+    // Địa chỉ đầu ra cho 2 ô liền kề
+    logic [11:0] addr_out_even;
+    logic [11:0] addr_out_odd;
+    assign addr_out_even = {i[5:0], 6'd0} + {6'd0, j[5:0]};
+    assign addr_out_odd  = {i[5:0], 6'd0} + {6'd0, j[5:0] + 6'd1};
+
+    // ==========================================
+    // 4. KHỞI TẠO BỘ NHỚ (DÙNG IP CHUẨN ram_1p VÀ ram_2p)
+    // ==========================================
+    logic [15:0] data_Wq_A, data_Wq_B, data_Wk_A, data_Wk_B, data_Wv_A, data_Wv_B;
+    logic [15:0] data_Q_A, data_K_A, data_K_B, data_V_A, data_V_B, data_Score_A, data_Softmax;
+    
+    // --- 3 KHỐI RAM TRUNG GIAN (Q, K, V) ---
+    logic [11:0] addr_Q_A;
+    assign addr_Q_A = (step == 0) ? addr_out_even : addr_broadcast_X;
+    ram_2p u_ram_Q (.clock(clk), .address_a(addr_Q_A), .address_b(addr_out_odd), .data_a(mac1_result), .data_b(mac2_result), .wren_a(we_Q), .wren_b(we_Q), .q_a(data_Q_A), .q_b());
+
+    logic [11:0] addr_K_A, addr_K_B;
+    assign addr_K_A = (step == 0) ? addr_out_even : addr_row_T_even;
+    assign addr_K_B = (step == 0) ? addr_out_odd  : addr_row_T_odd;
+    ram_2p u_ram_K (.clock(clk), .address_a(addr_K_A), .address_b(addr_K_B), .data_a(mac3_result), .data_b(mac4_result), .wren_a(we_K), .wren_b(we_K), .q_a(data_K_A), .q_b(data_K_B));
+
+    logic [11:0] addr_V_A, addr_V_B;
+    assign addr_V_A = (step == 1) ? addr_out_even : addr_col_even;
+    assign addr_V_B = (step == 1) ? addr_out_odd  : addr_col_odd;
+    ram_2p u_ram_V (.clock(clk), .address_a(addr_V_A), .address_b(addr_V_B), .data_a(mac3_result), .data_b(mac4_result), .wren_a(we_V), .wren_b(we_V), .q_a(data_V_A), .q_b(data_V_B));
+
+    // --- 3 KHỐI RAM TRỌNG SỐ Wq, Wk, Wv (Có MUX cho UART) ---
+    logic [11:0] wq_addr_a;
+    logic [15:0] wq_data_a;
+    logic        wq_we_a;
+    assign wq_addr_a = mode_ai_running ? addr_col_even : uart_addr;
+    assign wq_data_a = mode_ai_running ? 16'd0         : uart_data_in;
+    assign wq_we_a   = mode_ai_running ? 1'b0          : uart_we_Wq;
+    ram_2p u_Wq (.clock(clk), .address_a(wq_addr_a), .address_b(addr_col_odd), .data_a(wq_data_a), .data_b(16'd0), .wren_a(wq_we_a), .wren_b(1'b0), .q_a(data_Wq_A), .q_b(data_Wq_B));
+
+    logic [11:0] wk_addr_a;
+    logic [15:0] wk_data_a;
+    logic        wk_we_a;
+    assign wk_addr_a = mode_ai_running ? addr_col_even : uart_addr;
+    assign wk_data_a = mode_ai_running ? 16'd0         : uart_data_in;
+    assign wk_we_a   = mode_ai_running ? 1'b0          : uart_we_Wk;
+    ram_2p u_Wk (.clock(clk), .address_a(wk_addr_a), .address_b(addr_col_odd), .data_a(wk_data_a), .data_b(16'd0), .wren_a(wk_we_a), .wren_b(1'b0), .q_a(data_Wk_A), .q_b(data_Wk_B));
+
+    logic [11:0] wv_addr_a;
+    logic [15:0] wv_data_a;
+    logic        wv_we_a;
+    assign wv_addr_a = mode_ai_running ? addr_col_even : uart_addr;
+    assign wv_data_a = mode_ai_running ? 16'd0         : uart_data_in;
+    assign wv_we_a   = mode_ai_running ? 1'b0          : uart_we_Wv;
+    ram_2p u_Wv (.clock(clk), .address_a(wv_addr_a), .address_b(addr_col_odd), .data_a(wv_data_a), .data_b(16'd0), .wren_a(wv_we_a), .wren_b(1'b0), .q_a(data_Wv_A), .q_b(data_Wv_B));
+
+    // --- RAM Z (Kết quả cuối cùng) ---
+    logic [11:0] z_addr_a;
+    logic        z_we_a;
+    assign z_addr_a = mode_ai_running ? addr_out_even : uart_addr;
+    assign z_we_a   = mode_ai_running ? we_Z          : 1'b0;
+    ram_2p u_ram_Z (.clock(clk), .address_a(z_addr_a), .address_b(addr_out_odd), .data_a(mac1_result), .data_b(mac2_result), .wren_a(z_we_a), .wren_b(we_Z & mode_ai_running), .q_a(uart_data_Z_out), .q_b());
+
+    // --- RAM SCORE ---
+    logic [11:0] softmax_addr_Score;
+    logic [11:0] addr_Score_A;
+    logic [11:0] addr_Score_B;
+    assign addr_Score_A = (step == 2) ? softmax_addr_Score : addr_out_even;
+    assign addr_Score_B = (step == 2) ? 12'd0              : addr_out_odd; 
+
+    // Dùng $signed để ghép bit và cộng theo đúng chuẩn có dấu
+    logic signed [15:0] score_even_scaled;
+    logic signed [15:0] score_odd_scaled;
+    assign score_even_scaled = $signed({ {3{mac1_result[15]}}, mac1_result[15:3] }) + $signed({15'd0, mac1_result[2]});
+    assign score_odd_scaled  = $signed({ {3{mac2_result[15]}}, mac2_result[15:3] }) + $signed({15'd0, mac2_result[2]});
+    
+    logic we_Score_B;
+    assign we_Score_B = (step == 2) ? 1'b0 : we_Score;
+    
+    ram_2p u_ram_Score (.clock(clk), .address_a(addr_Score_A), .address_b(addr_Score_B), .data_a(score_even_scaled), .data_b(score_odd_scaled), .wren_a(we_Score), .wren_b(we_Score_B), .q_a(data_Score_A), .q_b());
+
+    // --- RAM SOFTMAX (Dùng ram_1p vì chỉ cần 1 cổng) ---
+    logic        softmax_we;
+    logic [11:0] softmax_addr_Softmax;
+    logic [15:0] softmax_data_out;
+    logic [11:0] addr_Softmax;
+    logic        we_Softmax_ram;
+    assign addr_Softmax   = (step == 2) ? softmax_addr_Softmax : addr_broadcast_X;
+    assign we_Softmax_ram = (step == 2) ? softmax_we           : 1'b0;
+    
+    ram_1p u_ram_Softmax (.clock(clk), .address(addr_Softmax), .data(softmax_data_out), .wren(we_Softmax_ram), .q(data_Softmax));
+
+    // ==========================================
+    // 5. MUX DỮ LIỆU CHO 4 LÕI MAC (QUAD-CORE)
+    // ==========================================
+    logic [15:0] mac_12_a, mac_1_b, mac_2_b;
+    logic [15:0] mac_34_a, mac_3_b, mac_4_b;
+
+    assign mac_12_a = (step == 0) ? data_X   : (step == 1) ? data_Q_A : (step == 3) ? data_Softmax : 16'd0;
+    assign mac_1_b  = (step == 0) ? data_Wq_A: (step == 1) ? data_K_A : (step == 3) ? data_V_A     : 16'd0;
+    assign mac_2_b  = (step == 0) ? data_Wq_B: (step == 1) ? data_K_B : (step == 3) ? data_V_B     : 16'd0;
+
+    assign mac_34_a = data_X;
+    assign mac_3_b  = (step == 0) ? data_Wk_A : data_Wv_A;
+    assign mac_4_b  = (step == 0) ? data_Wk_B : data_Wv_B;
+
+    mac_unit u_mac_1 (.clk(clk), .rst_n(rst_n), .en(mac_en), .clr_acc(mac_clr), .a_in(mac_12_a), .b_in(mac_1_b), .mac_out(mac1_result));
+    mac_unit u_mac_2 (.clk(clk), .rst_n(rst_n), .en(mac_en), .clr_acc(mac_clr), .a_in(mac_12_a), .b_in(mac_2_b), .mac_out(mac2_result));
+    mac_unit u_mac_3 (.clk(clk), .rst_n(rst_n), .en(mac_en), .clr_acc(mac_clr), .a_in(mac_34_a), .b_in(mac_3_b), .mac_out(mac3_result));
+    mac_unit u_mac_4 (.clk(clk), .rst_n(rst_n), .en(mac_en), .clr_acc(mac_clr), .a_in(mac_34_a), .b_in(mac_4_b), .mac_out(mac4_result));
+
+    // ==========================================
+    // 6. TÍCH HỢP SOFTMAX TOP
+    // ==========================================
+    logic [12:0] softmax_addr_Exp;
+    logic [15:0] data_Exp_out;
+    logic        start_softmax;
+    logic        softmax_done;
+
+    // BÍ KÍP CHỐNG TRÀN ROM: Kẹp địa chỉ tối đa ở 4095
+    logic [11:0] safe_addr_Exp;
+    assign safe_addr_Exp = (softmax_addr_Exp >= 13'd4095) ? 12'd4095 : softmax_addr_Exp[11:0];
+    
+    rom_exp u_rom_exp (.clock(clk), .address(safe_addr_Exp), .q(data_Exp_out));
+
+    logic [5:0] softmax_current_row;
+    logic signed [15:0] current_max_val;
+    assign softmax_current_row = softmax_addr_Score[11:6];
+    assign current_max_val     = max_array[softmax_current_row];
+
+    softmax_top u_softmax (
+        .clk          (clk), 
+        .rst_n        (rst_n), 
+        .start        (start_softmax), 
+        .done         (softmax_done),
+        .addr_Score   (softmax_addr_Score), 
+        .data_Score   (data_Score_A),
+        .max_val_in   (current_max_val),
+        .addr_Exp     (softmax_addr_Exp),      
+        .data_Exp     (data_Exp_out),
+        .we_Softmax   (softmax_we), 
+        .addr_Softmax (softmax_addr_Softmax), 
+        .data_Softmax (softmax_data_out)
+    );
+
+    // ==========================================
+    // 7. MÁY TRẠNG THÁI TỔNG (MASTER FSM - PIPELINED ALIGNED)
+    // ==========================================
+    typedef enum logic [2:0] {
+        S_IDLE          = 3'd0,
+        S_MAC_PIPELINE  = 3'd1, 
+        S_WRITE_RAM     = 3'd2,
+        S_NEXT_ELEM     = 3'd3,
+        S_START_SOFTMAX = 3'd4,
+        S_WAIT_SOFTMAX  = 3'd5,
+        S_DONE          = 3'd6
+    } state_t;
+
+    state_t state;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state         <= S_IDLE; 
+            done          <= 1'b0; 
+            step          <= '0;
+            we_Q          <= 1'b0; 
+            we_K          <= 1'b0; 
+            we_V          <= 1'b0; 
+            we_Score      <= 1'b0; 
+            we_Z          <= 1'b0;
+            mac_en        <= 1'b0; 
+            mac_clr       <= 1'b0; 
+            start_softmax <= 1'b0;
+            i             <= '0; 
+            j             <= '0; 
+            k             <= '0;
+        end 
+        else begin
+            case (state)
+                S_IDLE: begin
+                    done <= 1'b0;
+                    if (start) begin
+                        mac_clr <= 1'b1; // <--- [BÍ KÍP 1] Gửi lệnh xóa MAC SỚM 1 NHỊP
+                        state   <= S_MAC_PIPELINE;
+                        step    <= '0; 
+                        i       <= '0; 
+                        j       <= '0; 
+                        k       <= '0;
+                    end
+                end
+
+                // =========================================================
+                // TRÁI TIM CỦA PIPELINE: CĂN CHỈNH (ALIGN) CHUẨN XÁC 100%
+                // =========================================================
+                S_MAC_PIPELINE: begin
+                    // Lúc này mac_clr ĐÃ LÀ 1 (do state trước đó truyền sang).
+                    // Ở cuối nhịp k=0, MAC sẽ tự động được làm sạch.
+                    if (k == 0) begin
+                        mac_clr <= 1'b0; // Tắt cờ Clear để từ k=1 trở đi MAC bắt đầu cộng
+                        mac_en  <= 1'b1; // Bật MAC cho nhịp sau đón Data[0]
+                    end 
+                    else if (k >= 1 && k <= 63) begin
+                        mac_clr <= 1'b0;
+                        mac_en  <= 1'b1; // Liên tục cộng từ Data[1] đến Data[63]
+                    end
+                    else if (k == 64) begin
+                        mac_en <= 1'b0;  // Vừa đủ 64 phần tử, lập tức đóng cửa MAC
+                    end
+
+                    if (k < 65) begin
+                        k <= k + 1'b1;
+                    end else begin
+                        k     <= '0;
+                        state <= S_WRITE_RAM; // Chuyển sang ghi RAM
+                    end
+                end
+
+                S_WRITE_RAM: begin
+                    if (step == 0) begin
+                        we_Q <= 1'b1; 
+                        we_K <= 1'b1;
+                    end else if (step == 1) begin
+                        we_Score <= 1'b1; 
+                        we_V     <= 1'b1;
+                        
+                        // Tìm Max Online (Có dấu)
+                        if (j == 0) begin
+                            max_array[i] <= (score_even_scaled > score_odd_scaled) ? score_even_scaled : score_odd_scaled;
+                        end else begin
+                            if (score_even_scaled > max_array[i] && score_even_scaled >= score_odd_scaled) 
+                                max_array[i] <= score_even_scaled;
+                            else if (score_odd_scaled > max_array[i])
+                                max_array[i] <= score_odd_scaled;
+                        end
+                        
+                    end else if (step == 3) begin
+                        we_Z <= 1'b1;
+                    end
+                    state <= S_NEXT_ELEM;
+                end
+
+                S_NEXT_ELEM: begin
+                    we_Q     <= 1'b0; 
+                    we_K     <= 1'b0; 
+                    we_V     <= 1'b0; 
+                    we_Score <= 1'b0; 
+                    we_Z     <= 1'b0;
+                    
+                    if (j < 62) begin
+                        j       <= j + 2; // Bước nhảy quét 2 cột
+                        mac_clr <= 1'b1;  // <--- [BÍ KÍP 2] Gửi lệnh xóa MAC SỚM 1 NHỊP
+                        state   <= S_MAC_PIPELINE; 
+                    end else begin
+                        j <= '0;
+                        if (i < 63) begin
+                            i       <= i + 1'b1;
+                            mac_clr <= 1'b1; // <--- Gửi lệnh xóa MAC
+                            state   <= S_MAC_PIPELINE;
+                        end else begin
+                            i <= '0;
+                            if (step == 0) begin
+                                step    <= 2'd1; 
+                                mac_clr <= 1'b1; // <--- Gửi lệnh xóa MAC
+                                state   <= S_MAC_PIPELINE;
+                            end else if (step == 1) begin
+                                step  <= 2'd2; 
+                                state <= S_START_SOFTMAX;
+                            end else if (step == 3) begin
+                                state <= S_DONE; 
+                            end
+                        end
+                    end
+                end
+
+                S_START_SOFTMAX: begin
+                    start_softmax <= 1'b1;
+                    state         <= S_WAIT_SOFTMAX;
+                end
+
+                S_WAIT_SOFTMAX: begin
+                    start_softmax <= 1'b0;
+                    if (softmax_done) begin
+                        step    <= 2'd3;
+                        i       <= '0; 
+                        j       <= '0; 
+                        k       <= '0;
+                        mac_clr <= 1'b1; // <--- [BÍ KÍP 3] Gửi lệnh xóa MAC SỚM 1 NHỊP
+                        state   <= S_MAC_PIPELINE;
+                    end
+                end
+
+                S_DONE: begin
+                    done  <= 1'b1;
+                    state <= S_IDLE;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule

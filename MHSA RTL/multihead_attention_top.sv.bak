@@ -1,0 +1,178 @@
+`timescale 1ns / 1ps
+
+module multihead_attention_top (
+    input  logic        clk,
+    input  logic        rst_n,
+    input  logic        start,
+    output logic        done,
+
+    // Giao tiếp với RAM chứa ma trận X (Kích thước 64x64)
+    output logic [11:0] addr_X,
+    input  logic [15:0] data_X,
+
+    // Giao tiếp với RAM Z_Final đầu ra (Kích thước 64x64 - RAM_2X)
+    output logic        we_Z_final,
+    output logic [11:0] addr_Z_final_A,
+    output logic [11:0] addr_Z_final_B,
+    output logic [15:0] data_Z_final_A,
+    output logic [15:0] data_Z_final_B
+);
+
+    // ==========================================
+    // 1. KHAI BÁO CÁC MẢNG TÍN HIỆU KẾT NỐI (ROUTING ARRAYS)
+    // ==========================================
+    // Tín hiệu từ Linear QKV sang 4 Attention Heads
+    logic        we_Q_arr [4], we_K_arr [4], we_V_arr [4];
+    logic [9:0]  addr_QKV_arr [4];
+    logic [15:0] data_Q_arr [4], data_K_arr [4], data_V_arr [4];
+
+    // Tín hiệu điều khiển FSM cho 4 Attention Heads
+    logic start_heads;
+    logic [3:0] done_heads; // Cờ done của 4 head
+    
+    // Tín hiệu từ 4 Attention Heads sang Linear Output (Đọc ma trận Z)
+    logic [9:0]  addr_Z_read_arr [4];
+    logic [15:0] data_Z_out_arr [4];
+
+    // ==========================================
+    // 2. KHỞI TẠO CÁC ROM TRỌNG SỐ (WEIGHT ROMs)
+    // ==========================================
+    // Wq, Wk, Wv dùng Single-Port ROM vì Linear QKV chỉ đọc 1 địa chỉ mỗi nhịp
+    logic [11:0] addr_W_qkv;
+    logic [15:0] data_Wq, data_Wk, data_Wv;
+    
+    ROM_4096x16_1P u_rom_Wq (.clock(clk), .address(addr_W_qkv), .q(data_Wq));
+    ROM_4096x16_1P u_rom_Wk (.clock(clk), .address(addr_W_qkv), .q(data_Wk));
+    ROM_4096x16_1P u_rom_Wv (.clock(clk), .address(addr_W_qkv), .q(data_Wv));
+
+    // Wo dùng Dual-Port ROM vì Linear Output đọc 2 cột song song
+    logic [11:0] addr_Wo_A, addr_Wo_B;
+    logic [15:0] data_Wo_A, data_Wo_B;
+    
+    ROM_4096x16 u_rom_Wo (
+        .clock(clk), 
+        .address_a(addr_Wo_A), .address_b(addr_Wo_B), 
+        .q_a(data_Wo_A), .q_b(data_Wo_B)
+    );
+
+    // ==========================================
+    // 3. KHỞI TẠO KHỐI LINEAR QKV
+    // ==========================================
+    logic start_linear_qkv, done_linear_qkv;
+
+    linear_qkv_multihead u_linear_qkv (
+        .clk(clk), .rst_n(rst_n), .start(start_linear_qkv), .done(done_linear_qkv),
+        .addr_X(addr_X),         .data_X(data_X),
+        .addr_W(addr_W_qkv),     .data_Wq(data_Wq), .data_Wk(data_Wk), .data_Wv(data_Wv),
+        .we_Q(we_Q_arr),         .we_K(we_K_arr),   .we_V(we_V_arr),
+        .addr_out(addr_QKV_arr),
+        .data_Q_out(data_Q_arr), .data_K_out(data_K_arr), .data_V_out(data_V_arr)
+    );
+
+    // ==========================================
+    // 4. KHỞI TẠO 4 KHỐI ATTENTION HEADS (Bằng vòng lặp Generate)
+    // ==========================================
+    genvar h;
+    generate
+        for (h = 0; h < 4; h++) begin : gen_heads
+            attention_head u_head (
+                .clk            (clk),
+                .rst_n          (rst_n),
+                .start          (start_heads),
+                .done           (done_heads[h]),
+                // Nạp dữ liệu từ Linear QKV
+                .linear_we      (we_Q_arr[h]), // Cờ Ghi Q,K,V xuất ra đồng thời nên dùng we_Q làm chuẩn
+                .linear_addr    (addr_QKV_arr[h]),
+                .linear_data_Q  (data_Q_arr[h]),
+                .linear_data_K  (data_K_arr[h]),
+                .linear_data_V  (data_V_arr[h]),
+                // Cho phép Linear Output đọc kết quả Z
+                .addr_Z_read    (addr_Z_read_arr[h]),
+                .data_Z_out     (data_Z_out_arr[h])
+            );
+        end
+    endgenerate
+
+    // ==========================================
+    // 5. KHỞI TẠO KHỐI LINEAR OUTPUT
+    // ==========================================
+    logic start_linear_out, done_linear_out;
+
+    linear_output u_linear_out (
+        .clk        (clk), .rst_n(rst_n), .start(start_linear_out), .done(done_linear_out),
+        // Giao tiếp với RAM Z của 4 Head
+        .addr_Z     (addr_Z_read_arr),
+        .data_Z     (data_Z_out_arr),
+        // Giao tiếp với ROM W_O
+        .addr_Wo_A  (addr_Wo_A), .addr_Wo_B(addr_Wo_B),
+        .data_Wo_A  (data_Wo_A), .data_Wo_B(data_Wo_B),
+        // Ghi ra RAM cuối cùng
+        .we_Out     (we_Z_final),
+        .addr_Out_A (addr_Z_final_A), .addr_Out_B(addr_Z_final_B),
+        .data_Out_A (data_Z_final_A), .data_Out_B(data_Z_final_B)
+    );
+
+    // ==========================================
+    // 6. MASTER FSM (NGƯỜI NHẠC TRƯỞNG)
+    // ==========================================
+    typedef enum logic [2:0] {
+        S_IDLE          = 3'd0,
+        S_RUN_QKV       = 3'd1,
+        S_RUN_HEADS     = 3'd2,
+        S_RUN_OUT       = 3'd3,
+        S_DONE          = 3'd4
+    } state_t;
+    
+    state_t state;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state            <= S_IDLE;
+            done             <= 1'b0;
+            start_linear_qkv <= 1'b0;
+            start_heads      <= 1'b0;
+            start_linear_out <= 1'b0;
+        end 
+        else begin
+            case (state)
+                S_IDLE: begin
+                    done <= 1'b0;
+                    if (start) begin
+                        start_linear_qkv <= 1'b1; // Kích hoạt Phase 1
+                        state            <= S_RUN_QKV;
+                    end
+                end
+
+                S_RUN_QKV: begin
+                    start_linear_qkv <= 1'b0;
+                    if (done_linear_qkv) begin
+                        start_heads <= 1'b1; // Kích hoạt Phase 2
+                        state       <= S_RUN_HEADS;
+                    end
+                end
+
+                S_RUN_HEADS: begin
+                    start_heads <= 1'b0;
+                    // Chờ cả 4 head cùng báo done (Sử dụng toán tử AND bit logic `&`)
+                    if (&done_heads) begin 
+                        start_linear_out <= 1'b1; // Kích hoạt Phase 3
+                        state            <= S_RUN_OUT;
+                    end
+                end
+
+                S_RUN_OUT: begin
+                    start_linear_out <= 1'b0;
+                    if (done_linear_out) begin
+                        state <= S_DONE;
+                    end
+                end
+
+                S_DONE: begin
+                    done  <= 1'b1;
+                    state <= S_IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule

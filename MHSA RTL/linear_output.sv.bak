@@ -1,0 +1,181 @@
+`timescale 1ns / 1ps
+
+module linear_output (
+    input  logic        clk,
+    input  logic        rst_n,
+    input  logic        start,
+    output logic        done,
+    
+    // Giao tiếp với 4 RAM Z của 4 Heads (Mỗi RAM kích thước 1024x16, tương ứng 64x16)
+    // Ta chỉ đọc cổng B của các RAM Z này để tránh xung đột nếu Head đang ghi dữ liệu
+    output logic [9:0]  addr_Z [4],
+    input  logic [15:0] data_Z [4],
+    
+    // Giao tiếp với ROM Trọng số ngõ ra W_O (Kích thước 4096x16, tương ứng 64x64 - Dual Port)
+    output logic [11:0] addr_Wo_A,
+    output logic [11:0] addr_Wo_B,
+    input  logic [15:0] data_Wo_A,
+    input  logic [15:0] data_Wo_B,
+    
+    // Giao tiếp với RAM Output cuối cùng của khối Attention (Kích thước 4096x16, tương ứng 64x64 - RAM_2X)
+    output logic        we_Out,
+    output logic [11:0] addr_Out_A,
+    output logic [11:0] addr_Out_B,
+    output logic [15:0] data_Out_A,
+    output logic [15:0] data_Out_B
+);
+
+    // ==========================================
+    // 1. KHAI BÁO CÁC BIẾN ĐẾM VÀ TRẠNG THÁI FSM
+    // ==========================================
+    // i: hàng (0->63), j: cột (0->62, bước nhảy 2), k: phần tử tích chập trong vòng lặp (0->63)
+    logic [6:0] i, j, k; 
+    
+    typedef enum logic [2:0] {
+        S_IDLE         = 3'd0,
+        S_MAC_PIPELINE = 3'd1,
+        S_WRITE_RAM    = 3'd2,
+        S_NEXT_ELEM    = 3'd3,
+        S_DONE         = 3'd4
+    } state_t;
+    
+    state_t state;
+    
+    logic mac_en, mac_clr;
+    logic [15:0] mac1_result, mac2_result;
+
+    // ==========================================
+    // 2. BỘ MUX GHÉP NỐI Z (CONCATENATION ON-THE-FLY)
+    // ==========================================
+    logic [1:0] head_idx;
+    logic [3:0] local_k;
+    logic [15:0] z_concat_data;
+
+    // Phân tích biến chạy k (0 -> 63) để định tuyến bộ nhớ:
+    assign head_idx = k[5:4]; // 2 bit cao quyết định trích xuất từ Head nào (0, 1, 2, 3)
+    assign local_k  = k[3:0]; // 4 bit thấp là chỉ số cột cục bộ bên trong RAM Head đó (0->15)
+
+    always_comb begin
+        // Cấp địa chỉ đọc đồng thời cho cả 4 RAM Z của 4 Heads
+        // Cấu trúc địa chỉ: {6-bit hàng i, 4-bit cột cục bộ local_k} -> Vừa đủ 10-bit cho RAM 1024 words
+        for (int h = 0; h < 4; h++) begin
+            addr_Z[h] = {i[5:0], local_k};
+        end
+        
+        // MUX 4-to-1 lựa chọn dữ liệu từ Head thích hợp dựa trên tiến độ của vòng lặp k
+        case (head_idx)
+            2'd0: z_concat_data = data_Z[0];
+            2'd1: z_concat_data = data_Z[1];
+            2'd2: z_concat_data = data_Z[2];
+            2'd3: z_concat_data = data_Z[3];
+            default: z_concat_data = 16'd0;
+        endcase
+    end
+
+    // ==========================================
+    // 3. ĐỊA CHỈ ROM TRỌNG SỐ W_O VÀ RAM OUTPUT
+    // ==========================================
+    // Quét song song cột j và cột j+1 của ma trận trọng số W_O tại hàng k
+    assign addr_Wo_A = {k[5:0], j[5:0]};
+    assign addr_Wo_B = {k[5:0], j[5:0] + 6'd1};
+
+    // Địa chỉ chốt ghi kết quả sau cùng ra RAM Output (Kích thước 64x64)
+    assign addr_Out_A = {i[5:0], j[5:0]};
+    assign addr_Out_B = {i[5:0], j[5:0] + 6'd1};
+    
+    // Kết quả từ lõi MAC đã tự động được làm tròn và cắt bit về Q8.8 bên trong module mac_unit
+    assign data_Out_A = mac1_result;
+    assign data_Out_B = mac2_result;
+
+    // ==========================================
+    // 4. KHỞI TẠO DUAL-CORE MAC PIPELINE
+    // ==========================================
+    // Tín hiệu z_concat_data được broadcast song song tới cả 2 lõi MAC 
+    // vì chúng nhân chung một phần tử của ma trận Z_concat
+    mac u_mac_out1 (.clk(clk), .rst_n(rst_n), .en(mac_en), .clr_acc(mac_clr), .a_in(z_concat_data), .b_in(data_Wo_A), .mac_out(mac1_result));
+    mac u_mac_out2 (.clk(clk), .rst_n(rst_n), .en(mac_en), .clr_acc(mac_clr), .a_in(z_concat_data), .b_in(data_Wo_B), .mac_out(mac2_result));
+
+    // ==========================================
+    // 5. MÁY TRẠNG THÁI ĐIỀU KHIỂN (MASTER FSM)
+    // ==========================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state    <= S_IDLE;
+            done     <= 1'b0;
+            we_Out   <= 1'b0;
+            mac_en   <= 1'b0;
+            mac_clr  <= 1'b0;
+            i        <= '0;
+            j        <= '0;
+            k        <= '0;
+        end
+        else begin
+            case (state)
+                S_IDLE: begin
+                    done <= 1'b0;
+                    if (start) begin
+                        mac_clr <= 1'b1; // Gửi lệnh xóa accumulator sớm 1 nhịp nhằm chuẩn bị cho k=0
+                        state   <= S_MAC_PIPELINE;
+                        i       <= '0;
+                        j       <= '0;
+                        k       <= '0;
+                    end
+                end
+
+                S_MAC_PIPELINE: begin
+                    // Đồng bộ căn chỉnh Pipeline chính xác tuyệt đối theo mẫu thiết kế trước của bạn
+                    if (k == 0) begin
+                        mac_clr <= 1'b0;
+                        mac_en  <= 1'b1; // Kích hoạt lõi MAC nạp tích lũy
+                    end
+                    else if (k >= 1 && k <= 63) begin
+                        mac_clr <= 1'b0;
+                        mac_en  <= 1'b1; // Tích lũy liên tục từ phần tử 1 đến 63
+                    end
+                    else if (k == 64) begin
+                        mac_en  <= 1'b0; // Đóng cửa MAC, nhịp 64 này để accumulator chốt hoàn toàn giá trị cuối
+                    end
+
+                    if (k < 65) begin
+                        k <= k + 1'b1;
+                    end else begin
+                        k     <= '0;
+                        state <= S_WRITE_RAM; // Chuyển trạng thái để chuẩn bị nháy cờ ghi
+                    end
+                end
+
+                S_WRITE_RAM: begin
+                    we_Out <= 1'b1; // Kích hoạt bật cờ ghi vào RAM_2X ngõ ra (Ổn định xuyên suốt trạng thái sau)
+                    state  <= S_NEXT_ELEM;
+                end
+
+                S_NEXT_ELEM: begin
+                    we_Out <= 1'b0; // Tắt cờ ghi ngay lập tức khi kết thúc xung nhịp ghi cạnh sau
+                    
+                    if (j < 62) begin
+                        j       <= j + 2; // Bước nhảy 2 cột (Tính toán song song Dual-Core)
+                        mac_clr <= 1'b1;  // Phát lệnh xóa bộ tích lũy sớm 1 nhịp cho vòng lặp mới
+                        state   <= S_MAC_PIPELINE;
+                    end else begin
+                        j <= '0;
+                        if (i < 63) begin
+                            i       <= i + 1'b1; // Chuyển hàng tiếp theo
+                            mac_clr <= 1'b1;
+                            state   <= S_MAC_PIPELINE;
+                        end else begin
+                            state   <= S_DONE;
+                        end
+                    end
+                end
+
+                S_DONE: begin
+                    done  <= 1'b1;
+                    state <= S_IDLE;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule
